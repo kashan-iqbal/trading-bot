@@ -34,7 +34,7 @@ const { evaluateSpotStrategy } = require('./strategyFunction');
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const SECRET = process.env.WEBHOOK_SECRET || 'change-me-secret';
 const PORT = process.env.PORT || 9090;
-const USE_TOR = process.env.USE_TOR !== '0';      // route Telegram calls via Tor by default
+const USE_TOR = process.env.USE_TOR;      // route Telegram calls via Tor by default
 const PUBLIC_URL = (process.env.PUBLIC_URL || '').trim(); // your https tunnel, e.g. https://xyz.trycloudflare.com
 
 if (!BOT_TOKEN) throw new Error('Missing TELEGRAM_BOT_TOKEN — set it in .env');

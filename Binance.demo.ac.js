@@ -19,7 +19,6 @@
 
 const crypto = require('crypto');
 const TI = require('technicalindicators');
-const { ask } = require('./llm');
 const { evaluateSpotStrategy } = require('./strategyFunction');
 
 // --- environment switch -------------------------------------------------

@@ -106,10 +106,16 @@ async function registerWebhook() {
 }
 
 // ── only keep coins that are live, trading USDT spot pairs (real market) ────
+// Uses data-api.binance.vision (public market data, NOT geo-restricted) so it
+// works from cloud hosts like Render. api.binance.com returns HTTP 451 from
+// US/cloud IPs, which previously made `symbols` undefined → ".filter" crash.
+const BINANCE_DATA = process.env.BINANCE_DATA
 async function validateCoins(wanted) {
-  const res = await fetch('https://api.binance.com/api/v3/exchangeInfo?permissions=SPOT&symbolStatus=TRADING');
-  const { symbols } = await res.json();
-  const live = new Set(symbols.filter(s => s.quoteAsset === 'USDT' && s.status === 'TRADING').map(s => s.symbol));
+  const res = await fetch(`${BINANCE_DATA}/api/v3/exchangeInfo?permissions=SPOT&symbolStatus=TRADING`);
+  if (!res.ok) throw new Error(`Binance exchangeInfo ${res.status} — host geo-blocked? try BINANCE_DATA=https://data-api.binance.vision`);
+  const data = await res.json();
+  if (!Array.isArray(data.symbols)) throw new Error(`Binance returned no symbols (msg: ${data.msg || 'unknown'}) — likely geo-restricted`);
+  const live = new Set(data.symbols.filter(s => s.quoteAsset === 'USDT' && s.status === 'TRADING').map(s => s.symbol));
   return wanted.filter(c => live.has(c));
 }
 

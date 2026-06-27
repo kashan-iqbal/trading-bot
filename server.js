@@ -29,6 +29,8 @@ const { socksDispatcher } = require('fetch-socks');
 // read-only helpers from the Binance client — NO order-execution functions
 const { getIndicators, getMinNotional, getFreeBalance } = require('./Binance.demo.ac');
 const { evaluateSpotStrategy } = require('./strategyFunction');
+const db = require('./db');
+const { startMonitor, runOnce } = require('./monitor');
 
 // ── config (env-driven; production-safe defaults) ───────────────────────────
 // Robust boolean parse — env vars are STRINGS, so '0'/'false' must read false.
@@ -159,6 +161,25 @@ function formatTrades({ trades, scanned }) {
   return `📊 <b>${trades.length} setup(s)</b> from ${scanned} coins:\n\n${lines.join('\n\n')}`;
 }
 
+// format the audit/performance report for Telegram
+function formatAudit(a) {
+  const pct = n => `${n >= 0 ? '+' : ''}${n.toFixed(2)}%`;
+  const top = a.top10.length
+    ? a.top10.map((t, i) => `${i + 1}. ${t.coin}  ${pct(t.pnlPercent)}`).join('\n')
+    : '—';
+  return [
+    '📈 <b>Performance</b>',
+    `Wins/Losses  ${a.wins} / ${a.losses}  (${a.winRate.toFixed(1)}% win)`,
+    `Total gain   ${pct(a.totalWinPct)}`,
+    `Total loss   ${pct(a.totalLossPct)}`,
+    `Net          ${pct(a.netPct)}`,
+    `Open         ${a.open}`,
+    '',
+    '🏆 <b>Top 10 (highest TP %)</b>',
+    top,
+  ].join('\n');
+}
+
 // ── express app + Telegram webhook ──────────────────────────────────────────
 const app = express();
 app.use(express.json());
@@ -181,23 +202,59 @@ app.post(HOOK_PATH, async (req, res) => {
     await tgSend(chatId, '🔎 Scanning the market… (~20s)');
     try {
       const result = await scanTrades();
-      await tgSend(chatId, formatTrades(result));
+      const saved = db.ready() ? await db.recordSetups(result.trades) : 0;   // persist new setups
+      await tgSend(chatId, formatTrades(result) + (db.ready() ? `\n\n💾 stored ${saved} new trade(s) for tracking.` : ''));
     } catch (e) {
       await tgSend(chatId, `❌ scan failed: ${e.message}`);
     }
     return;
   }
-  return tgSend(chatId, 'Commands: <b>/trade</b> to scan for setups.');
+  if (text === '/audit' || text === '/stats') {
+    try {
+      await tgSend(chatId, formatAudit(await db.buildAudit()));
+    } catch (e) {
+      await tgSend(chatId, `❌ audit failed: ${e.message}`);
+    }
+    return;
+  }
+  return tgSend(chatId, 'Commands: <b>/trade</b> to scan, <b>/audit</b> for performance.');
 });
 
-// health + manual trigger (browser): GET /scan returns the JSON decisions
+// health + manual triggers (browser/curl)
 app.get('/', (_req, res) => res.send('trade server running'));
+
+// GET /scan — run the scan AND persist new setups
 app.get('/scan', async (_req, res) => {
-  try { res.json(await scanTrades()); }
+  try {
+    const result = await scanTrades();
+    const saved = db.ready() ? await db.recordSetups(result.trades) : 0;
+    res.json({ ...result, saved });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /measure — run one monitor pass now (resolve any trades that hit TP/SL)
+app.get('/measure', async (_req, res) => {
+  try { res.json(await runOnce()); }
   catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.listen(PORT, async () => {
-  console.log(`Listening on :${PORT}   webhook ${HOOK_PATH}   Tor:${USE_TOR ? 'on' : 'off'}`);
-  await registerWebhook();   // auto-registers through Tor if PUBLIC_URL is set
+// GET /audit — performance report as JSON
+app.get('/audit', async (_req, res) => {
+  try { res.json(await db.buildAudit()); }
+  catch (e) { res.status(500).json({ error: e.message }); }
 });
+
+// boot: connect Mongo (non-fatal) → listen → register webhook → start monitor
+async function start() {
+  try {
+    await db.connect();
+  } catch (e) {
+    console.error('⚠️  Mongo not connected:', e.message, '— /audit & tracking disabled until MONGODB_URI is set');
+  }
+  app.listen(PORT, async () => {
+    console.log(`Listening on :${PORT}   webhook ${HOOK_PATH}   Tor:${USE_TOR ? 'on' : 'off'}`);
+    await registerWebhook();
+    if (db.ready()) startMonitor();   // only run the monitor when the DB is up
+  });
+}
+start().catch(e => { console.error('startup failed:', e.message); process.exit(1); });

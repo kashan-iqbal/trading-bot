@@ -30,14 +30,22 @@ const { socksDispatcher } = require('fetch-socks');
 const { getIndicators, getMinNotional, getFreeBalance } = require('./Binance.demo.ac');
 const { evaluateSpotStrategy } = require('./strategyFunction');
 
-// ── config (from .env) ──────────────────────────────────────────────────────
+// ── config (env-driven; production-safe defaults) ───────────────────────────
+// Robust boolean parse — env vars are STRINGS, so '0'/'false' must read false.
+const bool = (v, def = false) =>
+  v == null || v === '' ? def : ['1', 'true', 'yes', 'on'].includes(String(v).trim().toLowerCase());
+
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const SECRET = process.env.WEBHOOK_SECRET || 'change-me-secret';
-const PORT = process.env.PORT || 9090;
-const USE_TOR = process.env.USE_TOR;      // route Telegram calls via Tor by default
-const PUBLIC_URL = (process.env.PUBLIC_URL || '').trim(); // your https tunnel, e.g. https://xyz.trycloudflare.com
+const PORT = process.env.PORT || 8000;             // cloud platforms (Koyeb/Render) inject PORT
+const USE_TOR = bool(process.env.USE_TOR, false);  // OFF by default; only a blocked LOCAL network sets USE_TOR=1
 
-if (!BOT_TOKEN) throw new Error('Missing TELEGRAM_BOT_TOKEN — set it in .env');
+// Accept a bare domain OR full URL; add https://, strip trailing slash; fall
+// back to the platform-provided URL so you don't have to set it by hand.
+let PUBLIC_URL = (process.env.PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || '').trim().replace(/\/+$/, '');
+if (PUBLIC_URL && !/^https?:\/\//i.test(PUBLIC_URL)) PUBLIC_URL = 'https://' + PUBLIC_URL;
+
+if (!BOT_TOKEN) throw new Error('Missing TELEGRAM_BOT_TOKEN — set it in env');
 const TG = 'https://api.telegram.org';
 const HOOK_PATH = `/telegram/${SECRET}`;
 
@@ -109,7 +117,7 @@ async function registerWebhook() {
 // Uses data-api.binance.vision (public market data, NOT geo-restricted) so it
 // works from cloud hosts like Render. api.binance.com returns HTTP 451 from
 // US/cloud IPs, which previously made `symbols` undefined → ".filter" crash.
-const BINANCE_DATA = process.env.BINANCE_DATA
+const BINANCE_DATA = process.env.BINANCE_DATA || 'https://data-api.binance.vision';
 async function validateCoins(wanted) {
   const res = await fetch(`${BINANCE_DATA}/api/v3/exchangeInfo?permissions=SPOT&symbolStatus=TRADING`);
   if (!res.ok) throw new Error(`Binance exchangeInfo ${res.status} — host geo-blocked? try BINANCE_DATA=https://data-api.binance.vision`);

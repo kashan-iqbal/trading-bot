@@ -51,23 +51,8 @@ if (!BOT_TOKEN) throw new Error('Missing TELEGRAM_BOT_TOKEN — set it in env');
 const TG = 'https://api.telegram.org';
 const HOOK_PATH = `/telegram/${SECRET}`;
 
-const COINS = [
-  'AVAXUSDT', 'BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'XRPUSDT', 'LINKUSDT',
-  'ADAUSDT', 'DOGEUSDT', 'TRXUSDT', 'DOTUSDT', 'POLUSDT', 'LTCUSDT', 'BCHUSDT',
-  'NEARUSDT', 'UNIUSDT', 'ATOMUSDT', 'ETCUSDT', 'XLMUSDT', 'FILUSDT', 'APTUSDT',
-  'ARBUSDT', 'OPUSDT', 'INJUSDT', 'SUIUSDT', 'SEIUSDT', 'TIAUSDT', 'RUNEUSDT',
-  'AAVEUSDT', 'GRTUSDT', 'ALGOUSDT', 'EGLDUSDT', 'FLOWUSDT', 'SANDUSDT', 'MANAUSDT',
-  'AXSUSDT', 'THETAUSDT', 'XTZUSDT', 'CHZUSDT', 'EOSUSDT', 'IMXUSDT', 'LDOUSDT',
-  'RENDERUSDT', 'STXUSDT', 'MKRUSDT', 'SNXUSDT', 'CRVUSDT', 'COMPUSDT', '1INCHUSDT',
-  'ENJUSDT', 'ZILUSDT', 'BATUSDT', 'DASHUSDT', 'ZECUSDT', 'KSMUSDT', 'QTUMUSDT',
-  'IOTAUSDT', 'NEOUSDT', 'GALAUSDT', 'APEUSDT', 'GMTUSDT', 'DYDXUSDT', 'FLOKIUSDT',
-  'PEPEUSDT', 'SHIBUSDT', 'BONKUSDT', 'WIFUSDT', 'JUPUSDT', 'PYTHUSDT', 'JTOUSDT',
-  'WLDUSDT', 'ORDIUSDT', 'ARUSDT', 'ROSEUSDT', 'ICPUSDT', 'KAVAUSDT', 'MINAUSDT',
-  'CFXUSDT', 'ASTRUSDT', 'ENSUSDT', 'GMXUSDT', 'SSVUSDT', 'BLURUSDT', 'MASKUSDT',
-  'LRCUSDT', 'ANKRUSDT', 'CELOUSDT', 'SKLUSDT', 'ONEUSDT', 'HBARUSDT', 'VETUSDT',
-  'ZRXUSDT', 'BANDUSDT', 'STORJUSDT', 'KNCUSDT', 'YFIUSDT', 'SUSHIUSDT', 'BALUSDT',
-  'RSRUSDT', 'FETUSDT', 'RADUSDT'
-];
+// How many coins to analyse in parallel (be nice to the data API).
+const SCAN_CONCURRENCY = parseInt(process.env.SCAN_CONCURRENCY || '8', 10);
 
 const torDispatcher = USE_TOR ? socksDispatcher({ type: 5, host: '127.0.0.1', port: 9050 }) : undefined;
 
@@ -115,41 +100,62 @@ async function registerWebhook() {
   }
 }
 
-// ── only keep coins that are live, trading USDT spot pairs (real market) ────
-// Uses data-api.binance.vision (public market data, NOT geo-restricted) so it
-// works from cloud hosts like Render. api.binance.com returns HTTP 451 from
-// US/cloud IPs, which previously made `symbols` undefined → ".filter" crash.
+// ── the full Binance spot universe (ALL trading USDT pairs) ─────────────────
+// Pulled from data-api.binance.vision (public, NOT geo-restricted, has every
+// listed coin). Returns the coin list + a minNotional map (one fetch, no
+// per-coin exchangeInfo calls). Excludes leveraged tokens (UP/DOWN/BULL/BEAR).
 const BINANCE_DATA = process.env.BINANCE_DATA || 'https://data-api.binance.vision';
-async function validateCoins(wanted) {
+async function getSpotUniverse() {
   const res = await fetch(`${BINANCE_DATA}/api/v3/exchangeInfo?permissions=SPOT&symbolStatus=TRADING`);
-  if (!res.ok) throw new Error(`Binance exchangeInfo ${res.status} — host geo-blocked? try BINANCE_DATA=https://data-api.binance.vision`);
+  if (!res.ok) throw new Error(`Binance exchangeInfo ${res.status} — geo-blocked? set BINANCE_DATA=https://data-api.binance.vision`);
   const data = await res.json();
-  if (!Array.isArray(data.symbols)) throw new Error(`Binance returned no symbols (msg: ${data.msg || 'unknown'}) — likely geo-restricted`);
-  const live = new Set(data.symbols.filter(s => s.quoteAsset === 'USDT' && s.status === 'TRADING').map(s => s.symbol));
-  return wanted.filter(c => live.has(c));
+  if (!Array.isArray(data.symbols)) throw new Error(`Binance returned no symbols (${data.msg || 'unknown'})`);
+
+  const isLeveraged = s => /(UP|DOWN|BULL|BEAR)USDT$/.test(s);
+  const coins = [];
+  const minNotional = new Map();
+  for (const s of data.symbols) {
+    if (s.quoteAsset !== 'USDT' || s.status !== 'TRADING' || !s.isSpotTradingAllowed) continue;
+    if (isLeveraged(s.symbol)) continue;
+    coins.push(s.symbol);
+    const not = s.filters.find(f => f.filterType === 'NOTIONAL' || f.filterType === 'MIN_NOTIONAL');
+    minNotional.set(s.symbol, not ? parseFloat(not.minNotional || not.notional || 0) : 0);
+  }
+  return { coins, minNotional };
 }
 
-// ── the scan: indicators → strategy decision (NO order placement) ───────────
+// run an async fn over items with limited concurrency
+async function mapPool(items, limit, fn) {
+  let i = 0;
+  await Promise.all(Array.from({ length: limit }, async () => {
+    while (i < items.length) { const idx = i++; await fn(items[idx]); }
+  }));
+}
+
+// ── the scan: indicators → strategy decision over ALL spot coins (NO orders) ─
 async function scanTrades() {
-  const valid = await validateCoins(COINS);
-  const usdtFree = await getFreeBalance('USDT');   // read-only
+  const { coins, minNotional } = await getSpotUniverse();
+  let usdtFree = 1000;
+  try { usdtFree = await getFreeBalance('USDT'); } catch { /* account geo-blocked → use default for sizing */ }
+
   const trades = [];
+  await mapPool(coins, SCAN_CONCURRENCY, async (coin) => {
+    try {
+      const coinIndicator = await getIndicators(coin);
+      coinIndicator.MIN_RR = 1.5;
+      coinIndicator.ACCOUNT_RISK_PERCENT = 1;
+      coinIndicator.RSI_OVERBOUGHT = 70;
+      coinIndicator.EMA_ZONE = `the price band between ema9 and ema21`;
 
-  for (const coin of valid) {
-    const coinIndicator = await getIndicators(coin);
-    coinIndicator.MIN_RR = 1.5;
-    coinIndicator.ACCOUNT_RISK_PERCENT = 1;
-    coinIndicator.RSI_OVERBOUGHT = 70;
-    coinIndicator.EMA_ZONE = `the price band between ema9 and ema21`;
-
-    const decision = evaluateSpotStrategy(coinIndicator, {
-      accountBalance: usdtFree,
-      minVolume: (await getMinNotional(coin)).minNotional,
-    });
-    decision.symbol = coin;
-    if (decision.Execute_Trade) trades.push(decision);
-  }
-  return { trades, scanned: valid.length, usdtFree };
+      const decision = evaluateSpotStrategy(coinIndicator, {
+        accountBalance: usdtFree,
+        minVolume: minNotional.get(coin) || 0,
+      });
+      decision.symbol = coin;
+      if (decision.Execute_Trade) trades.push(decision);
+    } catch { /* skip coins with insufficient data / transient errors */ }
+  });
+  return { trades, scanned: coins.length, usdtFree };
 }
 
 // format the decisions into a Telegram message
@@ -161,22 +167,36 @@ function formatTrades({ trades, scanned }) {
   return `📊 <b>${trades.length} setup(s)</b> from ${scanned} coins:\n\n${lines.join('\n\n')}`;
 }
 
-// format the audit/performance report for Telegram
+// format the audit/performance report for Telegram (complete, easy to read)
 function formatAudit(a) {
-  const pct = n => `${n >= 0 ? '+' : ''}${n.toFixed(2)}%`;
-  const top = a.top10.length
-    ? a.top10.map((t, i) => `${i + 1}. ${t.coin}  ${pct(t.pnlPercent)}`).join('\n')
+  const pct = n => `${n >= 0 ? '+' : ''}${(n || 0).toFixed(2)}%`;
+  const winList = a.top10.length
+    ? a.top10.map((t, i) => `${i + 1}. ${t.coin.replace('USDT', '')}  ${pct(t.pnlPercent)}`).join('\n')
     : '—';
+  const lossList = a.slHits.length
+    ? a.slHits.map((t, i) => `${i + 1}. ${t.coin.replace('USDT', '')}  ${pct(t.pnlPercent)}`).join('\n')
+    : '—';
+  const best = a.topProfit ? `${a.topProfit.coin.replace('USDT', '')} ${pct(a.topProfit.pnlPercent)}` : '—';
+
   return [
-    '📈 <b>Performance</b>',
-    `Wins/Losses  ${a.wins} / ${a.losses}  (${a.winRate.toFixed(1)}% win)`,
-    `Total gain   ${pct(a.totalWinPct)}`,
-    `Total loss   ${pct(a.totalLossPct)}`,
-    `Net          ${pct(a.netPct)}`,
-    `Open         ${a.open}`,
+    '📊 <b>PERFORMANCE REPORT</b>',
+    '──────────────',
+    `✅ Wins:   <b>${a.wins}</b>`,
+    `❌ Losses: <b>${a.losses}</b>`,
+    `🎯 Win rate: <b>${a.winRate.toFixed(1)}%</b>`,
+    `⏳ Open trades: <b>${a.open}</b>`,
+    '──────────────',
+    `📈 Total gain: <b>${pct(a.totalWinPct)}</b>`,
+    `📉 Total loss: <b>${pct(a.totalLossPct)}</b>`,
+    `💰 Net P&L:   <b>${pct(a.netPct)}</b>`,
+    `   avg win ${pct(a.avgWinPct)} · avg loss ${pct(a.avgLossPct)}`,
+    `🏆 Top profit: <b>${best}</b>`,
     '',
-    '🏆 <b>Top 10 (highest TP %)</b>',
-    top,
+    '🟢 <b>Top winners (TP hit)</b>',
+    winList,
+    '',
+    '🔴 <b>Hit stop-loss</b>',
+    lossList,
   ].join('\n');
 }
 
@@ -199,10 +219,11 @@ app.post(HOOK_PATH, async (req, res) => {
     return tgSend(chatId, '👋 Send <b>/trade</b> and I will scan the coin list for spot setups.');
   }
   if (text === '/trade' || text === 'trade') {
-    await tgSend(chatId, '🔎 Scanning the market… (~20s)');
+    await tgSend(chatId, '🔎 Scanning ALL Binance spot coins… (~30–60s)');
     try {
       const result = await scanTrades();
       const saved = db.ready() ? await db.recordSetups(result.trades) : 0;   // persist new setups
+      console.log(saved)
       await tgSend(chatId, formatTrades(result) + (db.ready() ? `\n\n💾 stored ${saved} new trade(s) for tracking.` : ''));
     } catch (e) {
       await tgSend(chatId, `❌ scan failed: ${e.message}`);

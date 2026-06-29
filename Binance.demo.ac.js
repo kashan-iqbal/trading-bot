@@ -82,17 +82,29 @@ async function signedRequest(method, path, params = {}) {
   return data;
 }
 
-// --- public (unsigned) helper ------------------------------------------
+// --- public (unsigned) market data --------------------------------------
+// Market data comes from the REAL market via data-api.binance.vision (public,
+// NOT geo-restricted, has ALL spot coins) so indicators work for every listed
+// coin and from cloud hosts. Account/orders still use BASE (testnet/live).
+const DATA = process.env.BINANCE_DATA || 'https://data-api.binance.vision';
+
+// Testnet price (matches the trading venue) — used by order monitors (executor).
 async function getPrice(symbol = 'BTCUSDT') {
   const res = await fetch(`${BASE}/api/v3/ticker/price?symbol=${symbol}`);
   return (await res.json()).price;
 }
 
-// Candlestick (kline) data — your chart.
+// Real-market price (data-api) — for scanners/audit that use real prices.
+async function getMarketPrice(symbol = 'BTCUSDT') {
+  const res = await fetch(`${DATA}/api/v3/ticker/price?symbol=${symbol}`);
+  return (await res.json()).price;
+}
+
+// Candlestick (kline) data — your chart (REAL market via data-api).
 //   interval: '1m','5m','15m','1h','4h','1d', ...
 //   limit:    how many candles (max 1000). 10 days of 1h = 240.
 async function getKlines(symbol = 'BTCUSDT', interval = '1h', limit = 240) {
-  const url = `${BASE}/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
+  const url = `${DATA}/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
   const res = await fetch(url);
   if (!res.ok) throw new Error(`Binance ${res.status}: ${await res.text()}`);
   const raw = await res.json();
@@ -181,9 +193,9 @@ function structureFrom(candles, window = 3) {
   };
 }
 
-// 24h rolling stats for the coin: volume, price change %, high/low.
+// 24h rolling stats for the coin: volume, price change %, high/low (REAL market).
 async function get24h(symbol = 'BTCUSDT') {
-  const res = await fetch(`${BASE}/api/v3/ticker/24hr?symbol=${symbol}`);
+  const res = await fetch(`${DATA}/api/v3/ticker/24hr?symbol=${symbol}`);
   if (!res.ok) throw new Error(`Binance ${res.status}: ${await res.text()}`);
   return res.json();
 }
@@ -570,7 +582,7 @@ async function placeTradeFromDecision(decision, { usdt = null } = {}) {
 }
 
 module.exports = {
-  ENV, getPrice, getKlines, getRSI, getEMA, getIndicators,
+  ENV, getPrice, getMarketPrice, getKlines, getRSI, getEMA, getIndicators,
   getMarketStructure, findPivots, get24h,
   getAccount, getBalances, getFreeBalance,
   marketOrder, limitOrder, getOpenOrders, cancelOrder,

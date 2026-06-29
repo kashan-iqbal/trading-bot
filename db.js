@@ -91,9 +91,10 @@ async function buildAudit() {
   const totalLossPct = sum(losses);     // negative
   const netPct = totalWinPct + totalLossPct;
 
-  const top10 = [...wins]
-    .sort((a, b) => (b.pnlPercent || 0) - (a.pnlPercent || 0))
-    .slice(0, 10);
+  // winners by highest profit %, losers (SL hits) by worst loss %
+  const top10 = [...wins].sort((a, b) => (b.pnlPercent || 0) - (a.pnlPercent || 0)).slice(0, 10);
+  const slHits = [...losses].sort((a, b) => (a.pnlPercent || 0) - (b.pnlPercent || 0)).slice(0, 10);
+  const lite = t => ({ coin: t.coin, entry: t.entry, sl: t.sl, tp: t.tp, pnlPercent: t.pnlPercent, exitPrice: t.exitPrice });
 
   return {
     total: all.length,
@@ -104,7 +105,12 @@ async function buildAudit() {
     totalWinPct,
     totalLossPct,
     netPct,
-    top10,
+    avgWinPct: wins.length ? totalWinPct / wins.length : 0,
+    avgLossPct: losses.length ? totalLossPct / losses.length : 0,
+    topProfit: top10[0] ? lite(top10[0]) : null,   // best-performing coin
+    top10: top10.map(lite),                         // top winners
+    slHits: slHits.map(lite),                       // coins that hit SL + their loss %
+    openTrades: open.map(t => ({ coin: t.coin, entry: t.entry, sl: t.sl, tp: t.tp })),
   };
 }
 

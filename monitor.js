@@ -5,11 +5,10 @@
 //   price <= sl  → LOSS  (tpHit false, pnl = (sl-entry)/entry*100, negative)
 // otherwise the trade stays OPEN.
 //
-// NOTE: stored entry/SL/TP come from getIndicators (testnet prices), so we poll
-// the SAME source (getPrice from Binance.demo.ac) to measure hits consistently.
-// For a real-market audit, switch the data source to data-api.binance.vision.
+// Stored entry/SL/TP now come from REAL-market indicators (data-api), so we poll
+// the REAL-market price (getMarketPrice) to measure TP/SL hits consistently.
 
-const { getPrice } = require('./Binance.demo.ac');
+const { getMarketPrice } = require('./Binance.demo.ac');
 const { getOpenTrades, resolveTrade } = require('./db');
 
 const MONITOR_SECONDS = parseInt(process.env.MONITOR_SECONDS || '20', 10);
@@ -18,7 +17,7 @@ let _timer = null;
 
 // resolve a single open trade if its price crossed TP or SL; returns the result
 async function checkTrade(t, onResolve) {
-  const price = parseFloat(await getPrice(t.coin));
+  const price = parseFloat(await getMarketPrice(t.coin));
   if (!Number.isFinite(price)) return null;
 
   let status, exitPrice, tpHit;
